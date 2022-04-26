@@ -1,0 +1,212 @@
+select*from truck_stop_parking_postgis;
+
+--deleting non interstate truck stops:
+begin;
+select*from truck_stop_parking_postgis where not (highway_ro ~ '^I.*$'); 
+delete from truck_stop_parking_postgis where not (highway_ro ~ '^I.*$')
+rollback;
+commit;
+
+--creating view for QGIS:
+Drop view if exists interstate_parking;
+create or replace view interstate_parking as 
+select*from truck_stop_parking_postgis;
+
+--counting the number of stops in each state:
+---Step 1: Altering table
+Alter table usstates add column NumStops integer default 0;
+select ogc_fid, NAME, NumStops from usstates limit 50;
+
+--Step 2: Select statement with spatial join to count number of points in each polygon.
+select states.ogc_fid, states.name, count(*) as NumStopsInState from
+usstates as states, truck_stop_parking_postgis as stops
+where ST_Contains(states.wkb_geometry, stops.wkb_geometry)
+group by states.ogc_fid;
+
+--Step 3: 
+With CountQuery as (
+	select states.ogc_fid, states.name, count(*) as NumStopsInState from
+usstates as states, truck_stop_parking_postgis as stops
+where ST_Contains(states.wkb_geometry, stops.wkb_geometry)
+group by states.ogc_fid	
+)
+update usstates
+set NumStops = CountQuery.NumStopsInState 
+from CountQuery
+where CountQuery.ogc_fid = usstates.ogc_fid;
+
+--Step 4: 
+select name, NumStops, ogc_fid from usstates 
+order by NumStops desc;
+
+begin;
+select name, NumStops, ogc_fid from usstates where (NumStops = 0);
+delete from usstates where (NumStops = 0);
+commit;
+
+
+--density map for states
+--step 1:
+alter table usstates add column statedensity numeric default 0;
+select name, statedensity, ogc_fid from usstates;
+
+--step 2:
+select states.name, states.ogc_fid,count(*)/(ST_Area(ST_Transform(states.wkb_geometry,3857))/1000000)
+as densitystopsinstate
+from usstates as states, truck_stop_parking_postgis as stops
+where ST_Contains(states.wkb_geometry, stops.wkb_geometry)
+group by states.ogc_fid;
+
+--step 3:
+with DensityQuery as (
+select states.name, states.ogc_fid,count(*)/(ST_Area(ST_Transform(states.wkb_geometry,3857))/1000000)
+as densitystopsinstate
+from usstates as states, truck_stop_parking_postgis as stops
+where ST_Contains(states.wkb_geometry, stops.wkb_geometry)
+group by states.ogc_fid
+)
+update usstates
+set statedensity = Round(CAST(DensityQuery.densitystopsinstate as numeric),5)
+from DensityQuery
+where DensityQuery.ogc_fid = usstates.ogc_fid;
+
+--step 4: 
+select ogc_fid, statedensity, name from usstates;
+
+--density map for road segments:
+alter table usprimaryroads add column roaddensity numeric default 0;
+select roaddensity, ogc_fid from usprimaryroads;
+
+--step 2:
+select roads.ogc_fid,count(*)/(ST_Distance(ST_Transform(roads.wkb_geometry,3857))/1000)
+as densitystopsonroad
+from usprimaryroads as roads, truck_stop_parking_postgis as stops
+where ST_Contains(roads.wkb_geometry, stops.wkb_geometry)
+group by roads.ogc_fid;
+
+
+--altering and populating usgrid:
+
+ALTER TABLE usgrid ADD COLUMN NumberRoadsInGridCell INTEGER DEFAULT 0;
+
+
+ALTER TABLE usgrid ADD COLUMN NumberStopsInGridCell INTEGER DEFAULT 0;
+
+ALTER TABLE usgrid ADD COLUMN TotalObjectsInGridCell INTEGER DEFAULT 0.0;
+
+select*from usgrid;
+--Count the number of truck stops in each grid cell:
+with PolygonQuery as (
+select grid.ogc_fid,count(*) as NumStops
+from truck_stop_parking_postgis as stops, usgrid as grid
+where ST_Contains(grid.wkb_geometry, stops.wkb_geometry)
+group by grid.ogc_fid
+)
+update usgrid
+set NumberStopsInGridCell = PolygonQuery.NumStops
+from PolygonQuery
+where PolygonQuery.ogc_fid = usgrid.ogc_fid;
+
+select*from usgrid
+order by NumberStopsInGridCell desc;
+
+--finding roads that intersect vector grid:
+with PolygonQuery as (
+select grid.ogc_fid,count(*) as NumRoads
+from usprimaryroads as roads, usgrid as grid
+where ST_Intersects(grid.wkb_geometry, roads.wkb_geometry)
+group by grid.ogc_fid
+)
+update usgrid
+set NumberRoadsInGridCell = PolygonQuery.NumRoads
+from PolygonQuery
+where PolygonQuery.ogc_fid = usgrid.ogc_fid;
+
+select*from usgrid
+order by NumberRoadsInGridCell desc;
+
+-- total count for each grid cell:
+update usgrid set TotalObjectsInGridCell = 
+NumberRoadsInGridCell + NumberStopsInGridCell;
+
+select id, TotalObjectsInGridCell from usgrid
+order by TotalObjectsInGridCell desc;
+
+--Buffer query?
+--add column containing the distance from stop to buffer
+alter table truck_stop_parking_postgis drop column if exists distance;
+alter table truck_stop_parking_postgis add column distance real;
+update truck_stop_parking_postgis set distance = 0.0;
+
+--step 3 :
+Drop table if exists roadsbuffer cascade; 
+create table roadsbuffer as select ogc_fid as id, ST_Buffer(wkb_geometry,1000) as geom from usprimaryroads;
+
+alter table roadsbuffer add primary key (id);
+
+create index "roadsbuffer_geom_idx" on roadsbuffer using GIST (geom);
+
+select ST_AsText(geom), id from roadsbuffer;
+
+
+--step 4: distance from each stop to the road:
+select stops.ogc_fid, stops.nhs_rest_s,
+ST_Transform(stops.wkb_geometry,3857) <-> ST_Transform(roads.wkb_geometry,3857) as DistanceToBuffer
+from truck_stop_parking_postgis as stops, usprimaryroads as roads limit 100;
+
+--step 5:
+SELECT min(DistanceToBuffer) as ShortestDistance, ogc_fid as Stops_pk from (
+    SELECT ST_Transform(stops.wkb_geometry,3857) <-> ST_Transform(roads.wkb_geometry,3857) as DistanceToBuffer, stops.ogc_fid
+    FROM truck_stop_parking_postgis as stops, usprimaryroads as roads
+  )
+as getMinDistanceQuery
+GROUP BY ogc_fid;
+
+--Step 6:
+with TableSubquery as (
+SELECT min(DistanceToBuffer) as ShortestDistance, ogc_fid as Stops_pk from (
+    SELECT ST_Transform(stops.wkb_geometry,3857) <-> ST_Transform(roads.wkb_geometry,3857) as DistanceToBuffer, stops.ogc_fid
+    FROM truck_stop_parking_postgis as stops, usprimaryroads as roads
+	  )
+as getMinDistanceQuery
+GROUP BY ogc_fid
+	)
+update truck_stop_parking_postgis
+set distance = TableSubquery.ShortestDistance
+from TableSubquery
+where truck_stop_parking_postgis.ogc_fid = TableSubquery.Stops_PK;
+
+SELECT * from truck_stop_parking_postgis order by distance asc;
+
+--using buffer to count stops in each road segment:
+--step 1:
+Alter table roadsbuffer add column NumStops integer default 0;
+select*from roadsbuffer limit 10;
+
+create table stopbox as 
+select a.nhs_rest_s, a.ogc_fid,ST_Envelope(a.wkb_geometry) from truck_stop_parking_postgis as A;
+select*from stopbox;
+--step 2:
+select roads.id, count(*) as NumStopsInBuffer from
+roadsbuffer as roads, stopbox as stops
+where 
+group by roads.id;
+
+--step3
+With CountQuery as (
+select roads.id, count(*) as NumStopsInbuffer from
+roadsbuffer as roads, truck_stop_parking_postgis as stops
+where ST_Contains(roads.geom, stops.wkb_geometry) or ST_Intersects(roads.geom,stops.wkb_geometry)
+group by roads.id	
+)
+update roadsbuffer
+set NumStops = CountQuery.NumStopsInbuffer 
+from CountQuery
+where CountQuery.id = roadsbuffer.id;
+	   
+--- OPTION 2:
+-- How may points are in each of the polylines in the wfroads table
+SELECT a.id, ST_NPoints(a.geom) as NumPoints, 
+ST_Length(ST_Transform(b.st_envelope,3857)) as RoadSegLength from roadsbuffer as a, stopbox as b 
+order by RoadSegLength desc;	   
+	   
